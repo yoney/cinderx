@@ -7,6 +7,7 @@
 #include "internal/pycore_pystate.h"
 
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/fork_support.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Jit/compilation_lock.h"
@@ -86,6 +87,18 @@ AotContext g_aot_ctx;
 std::recursive_mutex& freeThreadedJITEntrypointMutex() {
   static std::recursive_mutex mutex;
   return mutex;
+}
+
+void freeThreadedJITEntrypointAtForkChild() {
+  if constexpr (kFreeThreadedBuild) {
+    // Other threads disappear at fork. Reinit the mutex and restore only
+    // the surviving thread's recursion depth.
+    auto& mutex = freeThreadedJITEntrypointMutex();
+    resetMutexAfterFork(mutex);
+    for (size_t i = 0; i < freeThreadedJITEntrypointLockDepth; ++i) {
+      mutex.lock();
+    }
+  }
 }
 
 PyObject* yieldFromValue(

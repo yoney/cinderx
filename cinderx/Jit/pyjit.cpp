@@ -162,28 +162,37 @@ PyObject* forcedJitVectorcall(
   }
 
   if (result == Result::OK) {
-    JIT_DCHECK(
-        isJitCompiled(func),
-        "JIT succeeded for function {} but it is not recognized as compiled",
-        funcFullname(func));
-    return func->vectorcall(func_obj, stack, nargsf, kwnames);
+    vectorcallfunc entry;
+    {
+      FreeThreadedJITEntrypointGuard guard;
+      // Recheck in case another thread invalidated compilation while waiting.
+      entry = isJitCompiled(func) ? ftAtomicLoadPtrAcquire(func->vectorcall)
+                                  : getInterpretedVectorcall(func);
+    }
+    return entry(func_obj, stack, nargsf, kwnames);
   }
 
-  auto interp_entry = getInterpretedVectorcall(func);
+  vectorcallfunc interp_entry;
+  {
+    FreeThreadedJITEntrypointGuard guard;
+    interp_entry = getInterpretedVectorcall(func);
 
-  // Python errors shouldn't happen during compilation, but if they do, bubble
-  // them up without calling the function.
-  if (result == Result::PYTHON_EXCEPTION) {
-    if (func->func_code == code.getObj()) {
+    // Python errors shouldn't happen during compilation, but if they do, bubble
+    // them up without calling the function.
+    if (result == Result::PYTHON_EXCEPTION) {
+      if (func->func_code == code.getObj()) {
+        setVectorcall(func, interp_entry);
+      }
+      return nullptr;
+    }
+
+    // Reset entrypoint unless compilation was deferred or the code was
+    // replaced.
+    if (func->func_code == code.getObj() &&
+        result != Result::ALREADY_SCHEDULED && result != Result::PAUSED &&
+        result != Result::NO_PRELOADER) {
       setVectorcall(func, interp_entry);
     }
-    return nullptr;
-  }
-
-  // Reset entrypoint unless compilation was deferred or the code was replaced.
-  if (func->func_code == code.getObj() && result != Result::ALREADY_SCHEDULED &&
-      result != Result::PAUSED && result != Result::NO_PRELOADER) {
-    setVectorcall(func, interp_entry);
   }
 
   // There's been some kind of compilation error, explicitly call the
@@ -4174,6 +4183,7 @@ void jitAtForkParent() {
 }
 
 void jitAtForkChild() {
+  freeThreadedJITEntrypointAtForkChild();
   if (auto* state = getModuleState(); state != nullptr) {
     state->atForkChild();
   }

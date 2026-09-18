@@ -42,6 +42,8 @@ namespace cinderx::jit {
 // Only used to serialize FT-only entrypoints, but declared unconditionally so
 // callers can branch on kFreeThreadedBuild instead of the preprocessor.
 std::recursive_mutex& freeThreadedJITEntrypointMutex();
+inline thread_local size_t freeThreadedJITEntrypointLockDepth = 0;
+void freeThreadedJITEntrypointAtForkChild();
 
 // Free-threaded builds can enter top-level JIT operations concurrently:
 // function/code registration, compilation, and destruction hooks.
@@ -51,12 +53,25 @@ class FreeThreadedJITEntrypointGuard {
  public:
   FreeThreadedJITEntrypointGuard() {
     if constexpr (kFreeThreadedBuild) {
-      freeThreadedJITEntrypointMutex().lock();
+      auto& mutex = freeThreadedJITEntrypointMutex();
+      if (!mutex.try_lock()) {
+        // Detach while waiting so we don't block stop-the-world pauses.
+        auto* tstate = PyThreadState_GetUnchecked();
+        if (tstate != nullptr) {
+          tstate = PyEval_SaveThread();
+        }
+        mutex.lock();
+        if (tstate != nullptr) {
+          PyEval_RestoreThread(tstate);
+        }
+      }
+      ++freeThreadedJITEntrypointLockDepth;
     }
   }
 
   ~FreeThreadedJITEntrypointGuard() {
     if constexpr (kFreeThreadedBuild) {
+      --freeThreadedJITEntrypointLockDepth;
       freeThreadedJITEntrypointMutex().unlock();
     }
   }
