@@ -5,6 +5,7 @@
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 
 import cinderx.jit
 from cinderx.test_support import run_in_fork
@@ -154,3 +155,37 @@ class JITCompilationTest(unittest.TestCase):
 
         self.assertEqual(results, [89] * worker_count)
         self.assertTrue(cinderx.jit.is_jit_compiled(fibonacci))
+
+    @run_in_fork
+    def test_background_and_batch_compilation(self) -> None:
+        # Run TSAN without the jit:: and phmap:: race suppressions.
+        cinderx.jit.append_jit_list(f"{__name__}:<lambda>")
+        cinderx.jit.background_compile(True)
+        cinderx.jit.compile_after_n_calls(1)
+        count = 100
+        batch = [eval(f"lambda x: x + {i}") for i in range(count)]
+        start = threading.Barrier(2)
+
+        @cinderx.jit.jit_suppress
+        def compile_background() -> list[Callable[[int], int]]:
+            start.wait()
+            funcs: list[Callable[[int], int]] = []
+            for i in range(count):
+                fn = eval(f"lambda x: x + {i}")
+                fn(0)
+                fn(0)
+                funcs.append(fn)
+            return funcs
+
+        # Background finalization drains the queue while batch workers fill it.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            background = executor.submit(compile_background)
+            start.wait()
+            self.assertTrue(cinderx.jit.precompile_all(workers=2))
+            background_funcs = background.result()
+
+        cinderx.jit.wait_for_background_compiles()
+        for funcs in (batch, background_funcs):
+            for i, fn in enumerate(funcs):
+                self.assertTrue(cinderx.jit.is_jit_compiled(fn))
+                self.assertEqual(fn(10), 10 + i)
